@@ -426,6 +426,17 @@ function handleGroupFunction(
 }
 
 function handleISOAddressClaim(device: N2kDevice, n2kMsg: PGN_60928) {
+  // Own ISO address claim echoed on N2KAnalyzerOut (SK FromPgn) or
+  // socketcan loopback is not a peer. SimpleCan drops own-src only
+  // after cansend; CanbusStream always forwards PGN 60928. Registering
+  // that echo in devices[src] while cansend is false makes
+  // sendAddressClaim treat the address as taken and call
+  // increaseOwnAddress.
+  if (isOwnIsoAddressClaim(device, n2kMsg)) {
+    device.debug('ignoring own ISO address claim from src %d', n2kMsg.src)
+    return
+  }
+
   if (device.cansend == false || n2kMsg.src != device.address) {
     if (!device.devices[n2kMsg.src!]) {
       device.debug(`registering device ${n2kMsg.src}`)
@@ -496,7 +507,20 @@ function announceStartupMessages(device: N2kDevice) {
   sendConfigInformation(device)
 }
 
+const ADDRESS_CLAIM_MIN_INTERVAL_MS = 250
+
 function sendAddressClaim(device: N2kDevice) {
+  const now = Date.now()
+  if (
+    device.addressClaimSentAt !== undefined &&
+    now - device.addressClaimSentAt < ADDRESS_CLAIM_MIN_INTERVAL_MS
+  ) {
+    device.debug(
+      'rate-limiting address claim (last %d ms ago)',
+      now - device.addressClaimSentAt
+    )
+    return
+  }
   if (device.devices[device.address]) {
     //someone already has this address, so find a free one
     increaseOwnAddress(device)
@@ -505,7 +529,7 @@ function sendAddressClaim(device: N2kDevice) {
   device.sendPGN(device.addressClaim)
   const version = packageJson ? packageJson.version : 'unknown'
   device.setStatus(`Claimed address ${device.address} (canboatjs v${version})`)
-  device.addressClaimSentAt = Date.now()
+  device.addressClaimSentAt = now
   if (device.addressClaimChecker) {
     clearTimeout(device.addressClaimChecker)
   }
@@ -520,10 +544,13 @@ function sendAddressClaim(device: N2kDevice) {
     device.cansend = true
     announceStartupMessages(device)
     if (!device.sentAvailable) {
+      const ac: any = device.addressClaim || {}
+      const uniqueNumber = ac.fields?.uniqueNumber ?? ac.uniqueNumber ?? ac['Unique Number']
+      const available = { src: device.address, uniqueNumber }
       if (device.options.app) {
-        device.options.app.emit('nmea2000OutAvailable')
+        device.options.app.emit('nmea2000OutAvailable', available)
       }
-      device.emit('nmea2000OutAvailable')
+      device.emit('nmea2000OutAvailable', available)
       device.sentAvailable = true
     }
     //sendISORequest(device, 126996)
@@ -591,6 +618,18 @@ function sendPGNList(device: N2kDevice, dst: number) {
     dst
   )
   device.sendPGN(pgnList)
+}
+
+function isOwnIsoAddressClaim(device: N2kDevice, n2kMsg: PGN_60928) {
+  if (n2kMsg.src != device.address) {
+    return false
+  }
+  const received = toPgn(n2kMsg)
+  const own = toPgn(device.addressClaim)
+  if (!received || !own) {
+    return false
+  }
+  return Buffer.from(received).equals(Buffer.from(own))
 }
 
 function getISOAddressClaimAsUint64(pgn: any) {
